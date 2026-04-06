@@ -23,6 +23,13 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+# CRITICAL: Set CWD to a valid directory immediately.
+# launchd starts processes in / which causes EPERM in Node.js process.cwd()
+# This must happen before ANY imports that spawn subprocesses.
+_BRIDGE_DIR = Path(__file__).parent.resolve()
+os.chdir(_BRIDGE_DIR)
+os.environ["PWD"] = str(_BRIDGE_DIR)
+
 from telegram import Bot, BotCommand, Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -129,6 +136,7 @@ async def quick_ack(cwd: str, prompt: str) -> str:
         permission_mode="bypassPermissions",
         max_turns=1,
         extra_args={"dangerously-skip-permissions": None},
+        env={"HOME": str(Path.home()), "PWD": cwd},
         disallowed_tools=["Bash", "Read", "Write", "Edit", "Glob", "Grep",
                           "WebSearch", "WebFetch", "Agent"],
     )
@@ -164,6 +172,7 @@ async def ask_claude(bot_name: str, cwd: str, model: str, chat_id: int,
         permission_mode="bypassPermissions",
         max_turns=25,
         extra_args={"dangerously-skip-permissions": None},
+        env={"HOME": str(Path.home()), "PWD": cwd},
     )
     if CLAUDE_CLI:
         opts.cli_path = CLAUDE_CLI
