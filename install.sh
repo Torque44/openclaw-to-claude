@@ -122,8 +122,13 @@ done
 # ---------------------------------------------------------------------------
 echo ""
 echo "Installing Python dependencies..."
-$PYTHON -m pip install --quiet claude-agent-sdk python-telegram-bot apscheduler 2>&1 | tail -3
+$PYTHON -m pip install --quiet claude-agent-sdk python-telegram-bot apscheduler playwright 2>&1 | tail -3
 echo -e "${GREEN}✓${NC} Dependencies installed"
+
+# Install Playwright browser (for web browsing with user's Chrome cookies)
+echo "Installing Playwright Chromium (for browser access)..."
+$PYTHON -m playwright install chromium 2>&1 | tail -2
+echo -e "${GREEN}✓${NC} Playwright browser installed"
 
 # ---------------------------------------------------------------------------
 # 5. Install ffmpeg + whisper (for video/audio processing)

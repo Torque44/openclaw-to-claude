@@ -336,6 +336,72 @@ cat skills/<skill-name>/SKILL.md
 When a user asks for something that matches a skill, read that skill's SKILL.md first and follow its instructions.
 """)
 
+    # Detect Chrome profile path
+    import platform
+    if platform.system() == "Darwin":
+        chrome_path_str = 'Path.home() / "Library/Application Support/Google/Chrome"'
+    else:
+        chrome_path_str = 'Path.home() / ".config/google-chrome"'
+
+    # Also check for Arc, Brave, Edge
+    arc_exists = (Path.home() / "Library/Application Support/Arc/User Data").exists() if platform.system() == "Darwin" else False
+    brave_exists = (Path.home() / "Library/Application Support/BraveSoftware/Brave-Browser").exists() if platform.system() == "Darwin" else (Path.home() / ".config/BraveSoftware/Brave-Browser").exists()
+
+    browser_notes = []
+    if arc_exists:
+        browser_notes.append("Arc browser detected. Profile at: ~/Library/Application Support/Arc/User Data")
+    if brave_exists:
+        browser_notes.append("Brave browser detected. Profile at: ~/Library/Application Support/BraveSoftware/Brave-Browser (macOS) or ~/.config/BraveSoftware/Brave-Browser (Linux)")
+
+    # Browser section
+    sections.append("\n---\n## BROWSER ACCESS\n")
+    if browser_notes:
+        sections.append("**Detected browsers:** " + "; ".join(browser_notes) + "\n")
+    sections.append(f"""You can browse the web using Playwright with the user's actual Chrome/Arc/Brave browser profile.
+This means all their logins (FT, Business Times, Twitter, Gmail, etc.) are already active. No re-login needed.
+
+**To read a webpage or paywalled article:**
+```python
+from playwright.sync_api import sync_playwright
+import shutil, tempfile
+from pathlib import Path
+
+# Copy Chrome cookies to temp profile (Chrome must stay running)
+chrome_profile = {chrome_path_str}
+
+temp = Path(tempfile.mkdtemp(prefix="browse-"))
+src = chrome_profile / "Default"
+dst = temp / "Default"
+dst.mkdir(parents=True, exist_ok=True)
+for f in ["Cookies", "Cookies-journal", "Local Storage", "Session Storage", "Login Data", "Preferences"]:
+    s = src / f
+    if s.exists():
+        if s.is_dir():
+            shutil.copytree(str(s), str(dst / f), dirs_exist_ok=True)
+        else:
+            shutil.copy2(str(s), str(dst / f))
+
+with sync_playwright() as p:
+    browser = p.chromium.launch_persistent_context(str(temp), headless=False)
+    page = browser.new_page()
+    page.goto("https://example.com")
+    content = page.inner_text("body")
+    browser.close()
+shutil.rmtree(str(temp))
+```
+
+**When to use browser:**
+- Reading paywalled articles (FT, Bloomberg, Business Times)
+- Scraping Twitter/X profiles
+- Any site that needs login
+- ChatGPT prompt pipeline (~/claude-agents/chatgpt_pipeline.py)
+
+**When NOT to use browser (use tools instead):**
+- Public APIs (use curl/requests)
+- Web search (use WebSearch tool)
+- File downloads (use curl)
+""")
+
     # Universal rules
     sections.append("\n---\n## UNIVERSAL RULES (added by migration)\n")
     sections.append("""
