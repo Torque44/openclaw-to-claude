@@ -1,45 +1,45 @@
-# OpenClaw → Claude Code Telegram Bridge
+# OpenClaw to Claude Code Migration
 
-Migrate your OpenClaw Telegram bots to run on Claude Code. Same personas, same skills, same cron jobs. Zero API token cost (uses your Claude subscription).
+Migrate your OpenClaw Telegram bots to run on Claude Code. Same persona, same skills, same cron jobs, same MCP servers, same browser access. Zero API token cost (uses your Claude subscription).
 
-## What this does
+## Quick Start
 
-- Discovers all your OpenClaw profiles (`~/.openclaw`, `~/.openclaw-*`)
-- Extracts Telegram bot tokens, allowlists, persona files (SOUL/MEMORY/IDENTITY/USER)
-- Migrates cron jobs (schedule + prompts)
-- Copies skills
-- Assembles a `CLAUDE.md` system prompt from your existing persona files
-- Runs everything via Claude Agent SDK (which uses your Claude subscription)
+Open Claude Code and paste:
+
+```
+I want to migrate my OpenClaw Telegram bot(s) to run on Claude Code using my Claude subscription instead of API tokens.
+
+Clone this repo and run the migration: https://github.com/Torque44/openclaw-to-claude
+
+Read PROMPT.md from the repo for the full instructions, then execute the migration end-to-end. Don't ask me to run commands manually - you handle everything.
+```
+
+That's it. Claude Code discovers your OpenClaw setup, extracts everything, installs deps, configures the bridge, and tells you when to test on Telegram.
+
+## What gets migrated
+
+- Persona files (SOUL.md, MEMORY.md, IDENTITY.md, USER.md)
+- Telegram bot tokens + allowlists (zero re-pairing)
+- All skills (workspace/skills/)
+- Cron jobs (schedule + prompts)
+- MCP servers (Kite, OpenBB, finance tools, etc.)
+- Browser access (Chrome profile with all logins preserved)
+- Web search config (Tavily/Brave API keys)
 
 ## Prerequisites
 
-1. **Claude Code** installed and logged in
-   ```bash
-   npm install -g @anthropic-ai/claude-code
-   claude login
-   ```
+- **Claude Code** installed and logged in (`npm install -g @anthropic-ai/claude-code && claude login`)
+- **Python 3.10+**
+- **Claude subscription** (Pro $20/mo or Max $100/mo)
+- **Existing OpenClaw setup** with at least one Telegram bot
 
-2. **Python 3.10+**
-
-3. **Claude subscription** (Pro $20/mo or Max $100/mo)
-   - The bridge uses your subscription, not API credits
-   - Max 5x recommended for multiple bots + cron jobs
-
-4. **Existing OpenClaw setup** with at least one Telegram bot configured
-
-## Quick start
+## Manual install (alternative)
 
 ```bash
-git clone <this-repo>
-cd openclaw-migration
+git clone https://github.com/Torque44/openclaw-to-claude.git
+cd openclaw-to-claude
 ./install.sh
 ```
-
-That's it. The installer:
-1. Checks prerequisites
-2. Installs Python deps
-3. Discovers and migrates all your OpenClaw bots
-4. Optionally installs auto-start (launchd on Mac, systemd on Linux)
 
 ## Manual setup
 
