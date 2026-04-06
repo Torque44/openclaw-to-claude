@@ -267,9 +267,15 @@ def create_bot_app(bot_cfg: dict) -> Application | None:
     inbox = Path(cwd) / "Inbox"
 
     # ---- Message buffer: collects multi-message input ----
-    # Key: chat_id -> {"parts": [...], "timer": asyncio.TimerHandle, "last_update": Update}
     DEBOUNCE_SECONDS = 4  # Wait 4s of silence before processing
+    WAIT_SECONDS = 30     # Extended wait when user sends /wait
     _msg_buffers: dict[int, dict] = {}
+
+    # ---- Active query tracking (for /stop) ----
+    # chat_id -> {"task": asyncio.Task, "prompt": str, "cancelled": bool}
+    _active_queries: dict[int, dict] = {}
+    # chat_id -> str (last prompt that was stopped, for correction merging)
+    _stopped_prompts: dict[int, str] = {}
 
     async def _extract_parts(update: Update, context) -> list[str]:
         """Extract text + media from a single message into prompt parts."""
@@ -334,10 +340,19 @@ def create_bot_app(bot_cfg: dict) -> Application | None:
         all_parts = buf["parts"]
 
         # Combine all buffered message parts into one prompt
-        # Separate each message's parts with a newline
         prompt = "\n".join(all_parts)
         if not prompt.strip():
             return
+
+        # If there's a stopped prompt, merge correction with original task
+        if chat_id in _stopped_prompts:
+            original = _stopped_prompts.pop(chat_id)
+            prompt = (
+                f"ORIGINAL TASK:\n{original}\n\n"
+                f"USER CORRECTION (they stopped me and said):\n{prompt}\n\n"
+                f"Redo the original task with this correction applied."
+            )
+            log.info(f"[{name}] Merging correction with stopped task for {chat_id}")
 
         msg_count = buf["msg_count"]
         log.info(f"[{name}] Flushing {msg_count} buffered messages from {chat_id}: {prompt[:100]}")
@@ -361,14 +376,21 @@ def create_bot_app(bot_cfg: dict) -> Application | None:
 
         typing_task = asyncio.create_task(keep_typing())
 
-        try:
-            current_model = context.chat_data.get("model_override", model)
-            reply = await ask_claude(name, cwd, current_model, chat_id, prompt)
+        async def _run_query():
+            try:
+                current_model = context.chat_data.get("model_override", model)
+                reply = await ask_claude(name, cwd, current_model, chat_id, prompt)
+                for i in range(0, len(reply), 4096):
+                    await last_update.message.reply_text(reply[i:i + 4096])
+            except asyncio.CancelledError:
+                log.info(f"[{name}] Query cancelled for {chat_id}")
+            finally:
+                typing_task.cancel()
+                _active_queries.pop(chat_id, None)
 
-            for i in range(0, len(reply), 4096):
-                await last_update.message.reply_text(reply[i:i + 4096])
-        finally:
-            typing_task.cancel()
+        # Track active query so /stop can cancel it
+        task = asyncio.create_task(_run_query())
+        _active_queries[chat_id] = {"task": task, "prompt": prompt, "cancelled": False}
 
     async def handle_msg(update: Update, context):
         if not update.message:
@@ -433,6 +455,80 @@ def create_bot_app(bot_cfg: dict) -> Application | None:
         # Show typing while collecting messages
         await update.message.chat.send_action("typing")
 
+    async def cmd_go(update: Update, context):
+        """Force-flush the buffer immediately. Don't wait for the timer."""
+        if not update.message:
+            return
+        chat_id = update.effective_chat.id
+        if chat_id in _msg_buffers and _msg_buffers[chat_id]["parts"]:
+            if _msg_buffers[chat_id]["timer"] is not None:
+                _msg_buffers[chat_id]["timer"].cancel()
+            await _flush_buffer(chat_id, context)
+        else:
+            await update.message.reply_text("Nothing in buffer.")
+
+    async def cmd_wait(update: Update, context):
+        """Extend the buffer timer. Tells bot 'more messages coming, hold on'."""
+        if not update.message:
+            return
+        chat_id = update.effective_chat.id
+        if chat_id in _msg_buffers:
+            # Cancel current timer, set a longer one
+            if _msg_buffers[chat_id]["timer"] is not None:
+                _msg_buffers[chat_id]["timer"].cancel()
+            _msg_buffers[chat_id]["timer"] = asyncio.get_event_loop().call_later(
+                WAIT_SECONDS,
+                lambda cid=chat_id, ctx=context: asyncio.create_task(_flush_buffer(cid, ctx)),
+            )
+            count = _msg_buffers[chat_id]["msg_count"]
+            await update.message.reply_text(f"Waiting. {count} messages buffered. Send /go when done.")
+        else:
+            await update.message.reply_text("No messages buffered yet. Just start sending.")
+
+    async def cmd_stop(update: Update, context):
+        """Stop the current running query. Bot waits for correction."""
+        if not update.message:
+            return
+        chat_id = update.effective_chat.id
+
+        # Cancel active query if running
+        if chat_id in _active_queries:
+            aq = _active_queries[chat_id]
+            if aq["task"] and not aq["task"].done():
+                aq["task"].cancel()
+                aq["cancelled"] = True
+                _stopped_prompts[chat_id] = aq["prompt"]
+                await update.message.reply_text("Stopped. What's wrong? Send your correction, I'll redo it.")
+                log.info(f"[{name}] Query stopped by user in {chat_id}")
+                return
+
+        # Cancel buffer if waiting
+        if chat_id in _msg_buffers:
+            if _msg_buffers[chat_id]["timer"] is not None:
+                _msg_buffers[chat_id]["timer"].cancel()
+            count = _msg_buffers[chat_id]["msg_count"]
+            del _msg_buffers[chat_id]
+            await update.message.reply_text(f"Cleared {count} buffered messages.")
+            return
+
+        await update.message.reply_text("Nothing running.")
+
+    async def cmd_clear(update: Update, context):
+        """Clear buffer and forget any stopped task."""
+        if not update.message:
+            return
+        chat_id = update.effective_chat.id
+        cleared = False
+        if chat_id in _msg_buffers:
+            if _msg_buffers[chat_id]["timer"] is not None:
+                _msg_buffers[chat_id]["timer"].cancel()
+            del _msg_buffers[chat_id]
+            cleared = True
+        if chat_id in _stopped_prompts:
+            del _stopped_prompts[chat_id]
+            cleared = True
+        await update.message.reply_text("Cleared." if cleared else "Nothing to clear.")
+
     async def cmd_reset(update: Update, context):
         if not update.message:
             return
@@ -462,6 +558,13 @@ def create_bot_app(bot_cfg: dict) -> Application | None:
         await update.message.reply_text(f"{bot_name} | {m} | session: {sid[:8] if sid != 'none' else 'new'}...")
 
     app = Application.builder().token(token).build()
+    app.add_handler(CommandHandler("go", cmd_go))
+    app.add_handler(CommandHandler("g", cmd_go))
+    app.add_handler(CommandHandler("wait", cmd_wait))
+    app.add_handler(CommandHandler("w", cmd_wait))
+    app.add_handler(CommandHandler("stop", cmd_stop))
+    app.add_handler(CommandHandler("s", cmd_stop))
+    app.add_handler(CommandHandler("clear", cmd_clear))
     app.add_handler(CommandHandler("reset", cmd_reset))
     app.add_handler(CommandHandler("deep", cmd_deep))
     app.add_handler(CommandHandler("fast", cmd_fast))
