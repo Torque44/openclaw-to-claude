@@ -51,13 +51,16 @@ WAIT_SECONDS = 30
 MAX_BUFFER_MESSAGES = 100
 MAX_STOPPED_PROMPTS = 50
 
-# Find claude CLI
-CLAUDE_CLI = shutil.which("claude")
-if not CLAUDE_CLI:
-    for p in (Path.home() / ".local/share/fnm").rglob("claude"):
-        if p.is_file() and os.access(p, os.X_OK):
-            CLAUDE_CLI = str(p)
-            break
+# Use the wrapper script that cd's before running claude (fixes EPERM in launchd)
+CLAUDE_WRAPPER = str(_BRIDGE_DIR / "claude-wrapper.sh")
+# Fallback to direct CLI if wrapper doesn't exist
+if not Path(CLAUDE_WRAPPER).exists():
+    CLAUDE_WRAPPER = shutil.which("claude")
+    if not CLAUDE_WRAPPER:
+        for p in (Path.home() / ".local/share/fnm").rglob("claude"):
+            if p.is_file() and os.access(p, os.X_OK):
+                CLAUDE_WRAPPER = str(p)
+                break
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -136,12 +139,12 @@ async def quick_ack(cwd: str, prompt: str) -> str:
         permission_mode="bypassPermissions",
         max_turns=1,
         extra_args={"dangerously-skip-permissions": None},
-        env={"HOME": str(Path.home()), "PWD": cwd},
+        env={"HOME": str(Path.home()), "PWD": cwd, "CLAUDE_CWD": cwd},
         disallowed_tools=["Bash", "Read", "Write", "Edit", "Glob", "Grep",
                           "WebSearch", "WebFetch", "Agent"],
     )
-    if CLAUDE_CLI:
-        opts.cli_path = CLAUDE_CLI
+    if CLAUDE_WRAPPER:
+        opts.cli_path = CLAUDE_WRAPPER
     try:
         async for msg in query(prompt=ack_prompt, options=opts):
             if isinstance(msg, ResultMessage) and msg.result:
@@ -172,10 +175,10 @@ async def ask_claude(bot_name: str, cwd: str, model: str, chat_id: int,
         permission_mode="bypassPermissions",
         max_turns=25,
         extra_args={"dangerously-skip-permissions": None},
-        env={"HOME": str(Path.home()), "PWD": cwd},
+        env={"HOME": str(Path.home()), "PWD": cwd, "CLAUDE_CWD": cwd},
     )
-    if CLAUDE_CLI:
-        opts.cli_path = CLAUDE_CLI
+    if CLAUDE_WRAPPER:
+        opts.cli_path = CLAUDE_WRAPPER
     if existing_sid:
         opts.resume = existing_sid
     if mcp_config:
@@ -773,7 +776,7 @@ async def main():
         log.error("No bots in config")
         sys.exit(1)
 
-    if not CLAUDE_CLI:
+    if not CLAUDE_WRAPPER:
         log.error("Claude CLI not found")
         sys.exit(1)
 
@@ -783,7 +786,7 @@ async def main():
     except Exception:
         pass
 
-    log.info(f"Claude CLI: {CLAUDE_CLI}")
+    log.info(f"Claude CLI: {CLAUDE_WRAPPER}")
     log.info(f"Starting bridge v2 with {len(bots_cfg)} bot(s)")
 
     # Build bot apps
