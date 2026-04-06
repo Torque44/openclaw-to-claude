@@ -58,9 +58,6 @@ if not CLAUDE_CLI:
     if found:
         CLAUDE_CLI = Path(found)
 
-# Per-bot MCP configs (loaded at startup)
-_bot_mcp_configs: dict[str, dict] = {}
-
 SESSIONS_DIR = AGENTS_DIR / "sessions"
 SESSIONS_DIR.mkdir(exist_ok=True)
 
@@ -128,6 +125,64 @@ async def download_file(bot: Bot, file_id: str, filename: str, inbox: Path) -> P
 
 _busy: set[str] = set()
 
+# Keywords that suggest a complex task needing acknowledgment
+COMPLEX_KEYWORDS = [
+    "research", "find everything", "analyze", "create a", "build a", "write a",
+    "generate", "scrape", "search twitter", "search x", "deep dive", "compare",
+    "make a", "draft a", "compile", "investigate", "report on", "summarize all",
+    "from twitter", "from polymarket", "from linkedin", "cv", "resume", "cover letter",
+    "content plan", "strategy", "audit", "breakdown", "pipeline",
+]
+
+
+def _looks_complex(prompt: str) -> bool:
+    """Quick heuristic: does this look like a multi-step task?"""
+    lower = prompt.lower()
+    # Multiple sentences or long prompt
+    if len(prompt) > 200:
+        return True
+    # Contains complex keywords
+    matches = sum(1 for kw in COMPLEX_KEYWORDS if kw in lower)
+    if matches >= 1:
+        return True
+    return False
+
+
+async def quick_ack(bot_name: str, cwd: str, prompt: str) -> str:
+    """Fast Claude call (no tools, 1 turn) to get a casual acknowledgment."""
+    ack_prompt = (
+        f"User sent this task: \"{prompt}\"\n\n"
+        "Reply with ONLY a casual one-line acknowledgment with a rough time estimate. "
+        "Examples of good responses:\n"
+        "- 'give me 3 min, pulling up twitter'\n"
+        "- 'on it. 2 min for the research, another minute to write it up'\n"
+        "- '5 min. need to dig through a few sources'\n"
+        "- 'quick one, 30 sec'\n"
+        "Keep it short, natural, lowercase. No emoji. No details about what you'll do. "
+        "Just acknowledge and estimate."
+    )
+    opts = ClaudeAgentOptions(
+        cwd=cwd,
+        model="haiku",  # Fastest/cheapest model for ack
+        permission_mode="bypassPermissions",
+        max_turns=1,
+        disallowed_tools=["Bash", "Read", "Write", "Edit", "Glob", "Grep", "WebSearch", "WebFetch", "Agent"],
+    )
+    if CLAUDE_CLI:
+        opts.cli_path = str(CLAUDE_CLI)
+
+    try:
+        async for msg in query(prompt=ack_prompt, options=opts):
+            if isinstance(msg, ResultMessage):
+                if msg.result:
+                    result = msg.result.replace(" — ", " - ").replace("—", "-")
+                    return result
+                break
+    except Exception:
+        pass
+    return "on it. give me a minute."
+
+
 async def ask_claude(bot_name: str, cwd: str, model: str, chat_id: int, prompt: str) -> str:
     key = f"{bot_name}:{chat_id}"
     if key in _busy:
@@ -147,11 +202,6 @@ async def ask_claude(bot_name: str, cwd: str, model: str, chat_id: int, prompt: 
             opts.cli_path = str(CLAUDE_CLI)
         if existing_sid:
             opts.resume = existing_sid
-
-        # Load MCP servers if configured for this bot
-        mcp_config = _bot_mcp_configs.get(bot_name)
-        if mcp_config:
-            opts.mcp_servers = mcp_config
 
         result = ""
         new_sid = None
@@ -216,6 +266,110 @@ def create_bot_app(bot_cfg: dict) -> Application | None:
     dm_policy = tg_cfg.get("dmPolicy", "open")
     inbox = Path(cwd) / "Inbox"
 
+    # ---- Message buffer: collects multi-message input ----
+    # Key: chat_id -> {"parts": [...], "timer": asyncio.TimerHandle, "last_update": Update}
+    DEBOUNCE_SECONDS = 4  # Wait 4s of silence before processing
+    _msg_buffers: dict[int, dict] = {}
+
+    async def _extract_parts(update: Update, context) -> list[str]:
+        """Extract text + media from a single message into prompt parts."""
+        parts = []
+        text = update.message.text or update.message.caption or ""
+
+        if update.message.photo:
+            photo = update.message.photo[-1]
+            path = await download_file(context.bot, photo.file_id, "photo.jpg", inbox)
+            if path:
+                parts.append(f"[Photo saved at: {path}]")
+
+        if update.message.video:
+            vid = update.message.video
+            fname = vid.file_name or "video.mp4"
+            size_mb = (vid.file_size or 0) / (1024 * 1024)
+            path = await download_file(context.bot, vid.file_id, fname, inbox)
+            if path:
+                parts.append(f"[Video ({size_mb:.1f}MB) saved at: {path}. Use ffmpeg/whisper if needed.]")
+            else:
+                parts.append(f"[Video ({size_mb:.1f}MB) download failed - too large for Bot API.]")
+
+        if update.message.video_note:
+            path = await download_file(context.bot, update.message.video_note.file_id, "video_note.mp4", inbox)
+            if path:
+                parts.append(f"[Video note saved at: {path}]")
+
+        if update.message.document:
+            doc = update.message.document
+            fname = doc.file_name or "document"
+            path = await download_file(context.bot, doc.file_id, fname, inbox)
+            if path:
+                parts.append(f"[Document '{fname}' saved at: {path}]")
+
+        if update.message.voice:
+            path = await download_file(context.bot, update.message.voice.file_id, "voice.ogg", inbox)
+            if path:
+                parts.append(f"[Voice message ({update.message.voice.duration}s) saved at: {path}]")
+
+        if update.message.audio:
+            audio = update.message.audio
+            fname = audio.file_name or "audio.mp3"
+            path = await download_file(context.bot, audio.file_id, fname, inbox)
+            if path:
+                parts.append(f"[Audio '{fname}' saved at: {path}]")
+
+        if update.message.sticker:
+            parts.append(f"[Sticker: {update.message.sticker.emoji or '?'}]")
+
+        if text:
+            parts.insert(0, text)
+
+        return parts
+
+    async def _flush_buffer(chat_id: int, context):
+        """Called after debounce timer expires. Combines all buffered messages and sends to Claude."""
+        buf = _msg_buffers.pop(chat_id, None)
+        if not buf or not buf["parts"]:
+            return
+
+        last_update = buf["last_update"]
+        all_parts = buf["parts"]
+
+        # Combine all buffered message parts into one prompt
+        # Separate each message's parts with a newline
+        prompt = "\n".join(all_parts)
+        if not prompt.strip():
+            return
+
+        msg_count = buf["msg_count"]
+        log.info(f"[{name}] Flushing {msg_count} buffered messages from {chat_id}: {prompt[:100]}")
+
+        # For complex tasks: send quick ack first
+        is_complex = _looks_complex(prompt)
+        if is_complex:
+            await last_update.message.chat.send_action("typing")
+            ack = await quick_ack(name, cwd, prompt)
+            await last_update.message.reply_text(ack)
+            log.info(f"[{name}] Ack sent: {ack}")
+
+        # Keep sending typing indicator
+        async def keep_typing():
+            try:
+                while True:
+                    await asyncio.sleep(5)
+                    await last_update.message.chat.send_action("typing")
+            except asyncio.CancelledError:
+                pass
+
+        typing_task = asyncio.create_task(keep_typing())
+
+        try:
+            current_model = context.chat_data.get("model_override", model)
+            reply = await ask_claude(name, cwd, current_model, chat_id, prompt)
+
+            for i in range(0, len(reply), 4096):
+                await last_update.message.reply_text(reply[i:i + 4096])
+        finally:
+            typing_task.cancel()
+
     async def handle_msg(update: Update, context):
         if not update.message:
             return
@@ -229,8 +383,6 @@ def create_bot_app(bot_cfg: dict) -> Application | None:
             if allow_from and user_id not in allow_from:
                 return
 
-        # Build prompt from text + media
-        parts = []
         text = update.message.text or update.message.caption or ""
 
         # Groups: only respond on mention or reply
@@ -246,73 +398,40 @@ def create_bot_app(bot_cfg: dict) -> Application | None:
                 return
             if mentioned and bot_info.username:
                 text = text.replace(f"@{bot_info.username}", "").strip()
+                # Re-set text so _extract_parts picks up cleaned version
+                update.message.text = text
 
-        # Photos
-        if update.message.photo:
-            photo = update.message.photo[-1]
-            path = await download_file(context.bot, photo.file_id, "photo.jpg", inbox)
-            if path:
-                parts.append(f"[Photo saved at: {path}]")
-
-        # Videos
-        if update.message.video:
-            vid = update.message.video
-            fname = vid.file_name or "video.mp4"
-            size_mb = (vid.file_size or 0) / (1024 * 1024)
-            path = await download_file(context.bot, vid.file_id, fname, inbox)
-            if path:
-                parts.append(f"[Video ({size_mb:.1f}MB) saved at: {path}. Use ffmpeg/whisper if needed.]")
-            else:
-                parts.append(f"[Video ({size_mb:.1f}MB) download failed - too large for Bot API.]")
-
-        # Video notes
-        if update.message.video_note:
-            path = await download_file(context.bot, update.message.video_note.file_id, "video_note.mp4", inbox)
-            if path:
-                parts.append(f"[Video note saved at: {path}]")
-
-        # Documents
-        if update.message.document:
-            doc = update.message.document
-            fname = doc.file_name or "document"
-            path = await download_file(context.bot, doc.file_id, fname, inbox)
-            if path:
-                parts.append(f"[Document '{fname}' saved at: {path}]")
-
-        # Voice
-        if update.message.voice:
-            path = await download_file(context.bot, update.message.voice.file_id, "voice.ogg", inbox)
-            if path:
-                parts.append(f"[Voice message ({update.message.voice.duration}s) saved at: {path}]")
-
-        # Audio
-        if update.message.audio:
-            audio = update.message.audio
-            fname = audio.file_name or "audio.mp3"
-            path = await download_file(context.bot, audio.file_id, fname, inbox)
-            if path:
-                parts.append(f"[Audio '{fname}' saved at: {path}]")
-
-        # Stickers
-        if update.message.sticker:
-            parts.append(f"[Sticker: {update.message.sticker.emoji or '?'}]")
-
-        if text:
-            parts.insert(0, text)
-
-        prompt = "\n".join(parts)
-        if not prompt.strip():
+        # Extract parts from this message
+        parts = await _extract_parts(update, context)
+        if not parts:
             return
 
-        log.info(f"[{name}] From {user_id}: {prompt[:80]}")
+        # Add to buffer
+        if chat_id not in _msg_buffers:
+            _msg_buffers[chat_id] = {
+                "parts": [],
+                "timer": None,
+                "last_update": update,
+                "msg_count": 0,
+                "context": context,
+            }
+
+        _msg_buffers[chat_id]["parts"].extend(parts)
+        _msg_buffers[chat_id]["last_update"] = update
+        _msg_buffers[chat_id]["msg_count"] += 1
+
+        # Cancel previous timer
+        if _msg_buffers[chat_id]["timer"] is not None:
+            _msg_buffers[chat_id]["timer"].cancel()
+
+        # Start new debounce timer
+        _msg_buffers[chat_id]["timer"] = asyncio.get_event_loop().call_later(
+            DEBOUNCE_SECONDS,
+            lambda cid=chat_id, ctx=context: asyncio.create_task(_flush_buffer(cid, ctx)),
+        )
+
+        # Show typing while collecting messages
         await update.message.chat.send_action("typing")
-
-        # Check model override
-        current_model = context.chat_data.get("model_override", model)
-        reply = await ask_claude(name, cwd, current_model, chat_id, prompt)
-
-        for i in range(0, len(reply), 4096):
-            await update.message.reply_text(reply[i:i + 4096])
 
     async def cmd_reset(update: Update, context):
         if not update.message:
@@ -453,14 +572,6 @@ async def main():
 
     log.info(f"Claude CLI: {CLAUDE_CLI}")
     log.info(f"Starting bridge with {len(bots)} bot(s)")
-
-    # Load MCP configs per bot
-    for bot_cfg in bots:
-        mcp_path = bot_cfg.get("mcp_servers")
-        if mcp_path and Path(mcp_path).exists():
-            mcp_data = json.loads(Path(mcp_path).read_text())
-            _bot_mcp_configs[bot_cfg["name"]] = mcp_data.get("mcpServers", {})
-            log.info(f"[{bot_cfg['name']}] Loaded {len(_bot_mcp_configs[bot_cfg['name']])} MCP servers")
 
     # Set up cron scheduler
     scheduler = AsyncIOScheduler()
